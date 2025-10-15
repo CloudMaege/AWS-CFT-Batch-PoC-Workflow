@@ -8,9 +8,118 @@ Parameters:
     Description: The serial number of the provisioned IAM user programmatic access key. Increment by 1 and update the stack to rotate the key.
     Type: Number
     Default: 1
-
+  
+  VpcId:
+    Description: VPC ID where resources will be deployed
+    Type: AWS::EC2::VPC::Id
+  
+  SubnetId:
+    Description: Subnet ID for Batch and ECS tasks
+    Type: AWS::EC2::Subnet::Id
+  
+  RouteTableId:
+    Description: Route table ID for S3 VPC endpoint
+    Type: String
+  
 
 Resources:
+  #=====================================
+  # VPC Endpoints:
+  #=====================================
+  CloudWatchLogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  ECRAPIVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  ECRDKRVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouteTableId
+
+
+#=====================================
+# Security Groups:
+#=====================================
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W9
+            reason: Security group open to full 10 block for poc.
+          - id: F1000
+            reason: All Traffic is allowed outbound for PoC.
+          - id: W36
+            reason: Descriptions not required for PoC.
+    Properties:
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref BatchECSSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref BatchECSSecurityGroup
+
+  BatchECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W40
+            reason: Security group allowed outbound to all for PoC.
+          - id: W5
+            reason: Security group allowed outbound to all for PoC.
+          - id: W36
+            reason: Descriptions not required for PoC.
+    Properties:
+      GroupDescription: Security group for Batch and ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          Description: Allow any egress
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
   #=====================================
   # IAM Deployment User:
   #=====================================
@@ -684,6 +793,8 @@ Resources:
             reason: Policy needs to access * for poc.
           - id: F3
             reason: Policy needs to access * logs for poc.
+          - id: F38
+            reason: Passrole allowed for PoC. In production, scope down to specific roles.
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -705,8 +816,36 @@ Resources:
                 Resource: "*"
               - Effect: Allow
                 Action:
+                  - states:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - events:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
                   - sqs:DeleteMessage
                 Resource: !GetAtt FileProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - batch:SubmitJob
+                  - batch:DescribeJobs
+                Resource: 
+                  - !Ref BatchJobQueue
+                  - !Ref BatchJobDefinition
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:DescribeTasks
+                  - iam:PassRole
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource:
+                  - !Sub "${S3InputBucket.Arn}/*"
+                  - !Sub "${S3OutputBucket.Arn}/*"
 
   FileProcessingStateMachine:
     Type: AWS::StepFunctions::StateMachine
@@ -715,7 +854,7 @@ Resources:
       RoleArn: !GetAtt FileProcessingStepFunctionRole.Arn
       DefinitionString: !Sub |
         {
-          "Comment": "File processing workflow",
+          "Comment": "File processing workflow with Batch and Fargate routing",
           "StartAt": "ProcessFile",
           "States": {
             "ProcessFile": {
@@ -726,20 +865,100 @@ Resources:
                 "metadata.$": "$.metadata",
                 "processorType.$": "$.metadata.processor-type",
                 "sqsInfo.$": "$.sqsInfo",
-                "timestamp.$": "$$.State.EnteredTime"
+                "timestamp.$": "$$.State.EnteredTime",
+                "securityGroups": ["${BatchECSSecurityGroup}"]
               },
-              "Next": "LogProcessorType"
+              "Next": "CheckProcessorType"
             },
-            "LogProcessorType": {
-              "Type": "Pass",
+            "CheckProcessorType": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.processorType",
+                  "StringEquals": "pool",
+                  "Next": "SubmitBatchJob"
+                }
+              ],
+              "Default": "RunFargateTask"
+            },
+            "SubmitBatchJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::batch:submitJob.sync",
               "Parameters": {
-                "processingResult": "File processing completed - ready for SQS cleanup",
-                "sourceBucket.$": "$.sourceBucket",
-                "objectKey.$": "$.objectKey",
-                "processorType.$": "$.processorType",
-                "sqsInfo.$": "$.sqsInfo"
+                "JobDefinition": "${BatchJobDefinition}",
+                "JobName.$": "States.Format('job-{}', States.UUID())",
+                "JobQueue": "${BatchJobQueue}",
+                "ContainerOverrides": {
+                  "Environment": [
+                    {
+                      "Name": "SOURCE_BUCKET",
+                      "Value.$": "$.sourceBucket"
+                    },
+                    {
+                      "Name": "OBJECT_KEY",
+                      "Value.$": "$.objectKey"
+                    },
+                    {
+                      "Name": "DEST_BUCKET",
+                      "Value.$": "$.metadata.output-destination"
+                    }
+                  ]
+                }
               },
-              "Next": "DeleteSQSMessage"
+              "Next": "ValidateOutput"
+            },
+            "RunFargateTask": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "TaskDefinition": "${ECSTaskDefinition}",
+                "Cluster": "${ECSCluster}",
+                "LaunchType": "FARGATE",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ["${SubnetId}"],
+                    "SecurityGroups.$": "$.securityGroups",
+                    "AssignPublicIp": "DISABLED"
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "pdf-converter",
+                      "Environment": [
+                        {
+                          "Name": "SOURCE_BUCKET",
+                          "Value.$": "$.sourceBucket"
+                        },
+                        {
+                          "Name": "OBJECT_KEY",
+                          "Value.$": "$.objectKey"
+                        },
+                        {
+                          "Name": "DEST_BUCKET",
+                          "Value.$": "$.metadata.output-destination"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Next": "ValidateOutput"
+            },
+            "ValidateOutput": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+              "Parameters": {
+                "Bucket.$": "$.metadata.output-destination",
+                "Key.$": "States.Format('{}.pdf', States.ArrayGetItem(States.StringSplit($.objectKey, '.'), 0))"
+              },
+              "Next": "DeleteSQSMessage",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed"
+                }
+              ]
             },
             "DeleteSQSMessage": {
               "Type": "Task",
@@ -749,6 +968,10 @@ Resources:
                 "ReceiptHandle.$": "$.sqsInfo.receiptHandle"
               },
               "End": true
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Cause": "File processing failed - output validation failed"
             }
           }
         }
@@ -802,6 +1025,7 @@ Resources:
             Effect: Allow
             Principal: "*"
             Action:
+              - ecr:GetAuthorizationToken
               - ecr:BatchCheckLayerAvailability
               - ecr:GetDownloadUrlForLayer
               - ecr:DescribeRepositories
@@ -869,6 +1093,7 @@ Resources:
             Effect: Allow
             Principal: "*"
             Action:
+              - ecr:GetAuthorizationToken
               - ecr:BatchCheckLayerAvailability
               - ecr:GetDownloadUrlForLayer
               - ecr:DescribeRepositories
@@ -908,82 +1133,166 @@ Resources:
           }
 
   #============================
-  # Batch IAM Roles:
+  # Batch Resources:
   #============================
-  # BatchPoCServiceRole:
-  #   Type: AWS::IAM::Role
-  #   Metadata:
-  #     cfn_nag:
-  #       rules_to_suppress:
-  #         - id: W28
-  #           reason: Desired resource name assigned.
-  #         - id: W11
-  #           reason: Logging policy needs to access *.
-  #   Properties:
-  #     RoleName: BatchPoC-Service-Role"
-  #     AssumeRolePolicyDocument:
-  #       Statement:
-  #       - Effect: Allow
-  #         Principal:
-  #           Service:
-  #             - batch.amazonaws.com
-  #         Action: sts:AssumeRole
-  #     ManagedPolicyArns:
-  #       - 'arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole'
+  BatchExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Role should have permissions to pull any image from ECR for PoC.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${S3InputBucket.Arn}/*"
+                  - !Sub "${S3OutputBucket.Arn}/*"
 
-  # # Compute Environment
-  # BatchPoCCompute:
-  #   Type: "AWS::Batch::ComputeEnvironment"
-  #   Properties:
-  #     Type: MANAGED
-  #     State: ENABLED
-  #     ServiceRole: !GetAtt 'BatchPoCServiceRole.Arn'
-  #     ComputeEnvironmentName: "BatchPoC-ComputeEnv"
-  #     ComputeResources: 
-  #       Type: FARGATE
-  #       MaxvCpus: 2000
-  #       # SecurityGroupIds: 
-  #       #   - !Ref IngestionLambdaSecurityGroup
-  #       # Subnets:
-  #       #   - Fn::ImportValue: !Sub "${VPCStackName}:VPC-Private-Subnet-A"
-  #       #   - Fn::ImportValue: !Sub "${VPCStackName}:VPC-Private-Subnet-B"
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
 
-  # # Compute Queue
-  # BatchPoCQueue:
-  #   Type: "AWS::Batch::JobQueue"
-  #   Properties:
-  #     JobQueueName: "BatchPoC-Queue"
-  #     ComputeEnvironmentOrder: 
-  #       - ComputeEnvironment: !Ref BatchPoCCompute
-  #         Order: 1
-  #     Priority: 1
-  #     State: "ENABLED"
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeEnvironmentName: !Sub "${AWS::StackName}-compute-env"
+      ComputeResources:
+        Type: FARGATE
+        MaxvCpus: 256
+        Subnets:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref BatchECSSecurityGroup
 
-  # # Batch Job
-  # BatchPoCJob:
-  #   Type: "AWS::Batch::JobDefinition"
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub "${AWS::StackName}-job-queue"
+      ComputeEnvironmentOrder:
+        - ComputeEnvironment: !Ref BatchComputeEnvironment
+          Order: 1
+      Priority: 1
+      State: ENABLED
+
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: !Sub "${AWS::StackName}-pdf-converter"
+      PlatformCapabilities:
+        - FARGATE
+      ContainerProperties:
+        Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/batch-poc-pdfconverter:latest"
+        JobRoleArn: !GetAtt BatchExecutionRole.Arn
+        ExecutionRoleArn: !GetAtt BatchExecutionRole.Arn
+        ResourceRequirements:
+          - Type: VCPU
+            Value: "0.25"
+          - Type: MEMORY
+            Value: "512"
+        NetworkConfiguration:
+          AssignPublicIp: DISABLED
+      RetryStrategy:
+        Attempts: 3
+
+  #============================
+  # ECS Resources for Fargate:
+  #============================
+  # ECSServiceLinkedRole:
+  #   Type: AWS::IAM::ServiceLinkedRole
   #   Properties:
-  #     Type: Container
-  #     JobDefinitionName: BatchPoC-Job"
-  #     RetryStrategy: 
-  #       Attempts: 3
-  #     ContainerProperties:
-  #       # JobRoleArn: !Ref IngestionLambdaExecutionRole
-  #       # ExecutionRoleArn: !GetAtt 'IngestionLambdaExecutionRole.Arn'
-  #       # Image:
-  #       #   Fn::Join:
-  #       #   - ''
-  #       #   - - 730739766451.dkr.ecr.
-  #       #     - !Ref AWS::Region
-  #       #     - .amazonaws.com/
-  #       #     - !Ref Redis2RawContainerImageName
-  #       ResourceRequirements:
-  #         - Type: MEMORY
-  #           Value: "8192"
-  #         - Type: VCPU
-  #           Value: "4"
-  #     PlatformCapabilities:
-  #       - FARGATE
+  #     AWSServiceName: ecs.amazonaws.com
+  #     Description: Service-linked role for Amazon ECS
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-fargate-cluster"
+      CapacityProviders:
+        - FARGATE
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-pdf-converter"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn: !GetAtt BatchExecutionRole.Arn
+      TaskRoleArn: !GetAtt BatchExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: pdf-converter
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/batch-poc-pdfconverter:latest"
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log Encryption not required for this PoC.
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-pdf-converter"
+      RetentionInDays: 14
 
 
 #==============================

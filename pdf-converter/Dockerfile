@@ -1,4 +1,4 @@
-FROM python:3.9-slim
+FROM --platform=linux/amd64 python:3.9-slim
 
 WORKDIR /app
 
@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY pdf_converter.py .
 
-CMD ["python", "pdf_converter.py"]
+CMD ["/usr/local/bin/python", "pdf_converter.py"]

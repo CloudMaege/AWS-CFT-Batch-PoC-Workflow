@@ -26,7 +26,7 @@ def lambda_handler(event, context):
     
     # Configuration from environment variables
     bucket_name = os.environ.get('BUCKET_NAME', '')
-    print(bucket_name)
+    print(f"output bucket: {bucket_name}")
     
     # Initialize S3 client
     s3 = boto3.client('s3')
@@ -43,7 +43,7 @@ def lambda_handler(event, context):
     metadata = {
         "customer": "AnyCompany",
         "processor-type": "pool",
-        "output-destination": bucket_name
+        "output-destination": "batch-poc-output-bucket-123456789101"
     }
     
     try:
