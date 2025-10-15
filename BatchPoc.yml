@@ -267,6 +267,17 @@ Resources:
   #==============================
   # SQS Queue for File Processing:
   #==============================
+  SQSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log Encryption not required for this PoC.
+    Properties:
+      LogGroupName: !Sub "/aws/sqs/${AWS::StackName}-file-processing-queue"
+      RetentionInDays: 14
+
   FileProcessingQueue:
     Type: AWS::SQS::Queue
     Metadata:
