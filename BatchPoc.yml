@@ -507,7 +507,7 @@ Resources:
       Runtime: python3.9
       Handler: index.handler
       Role: !GetAtt BucketNotificationLambdaRole.Arn
-      Timeout: 60
+      Timeout: 300
       Code:
         ZipFile: |
           import boto3
@@ -905,7 +905,8 @@ Resources:
                   ]
                 }
               },
-              "Next": "ValidateOutput"
+              "Next": "ValidateOutput",
+              "ResultPath": "$.batch"
             },
             "RunFargateTask": {
               "Type": "Task",
@@ -943,7 +944,8 @@ Resources:
                   ]
                 }
               },
-              "Next": "ValidateOutput"
+              "Next": "ValidateOutput",
+              "ResultPath": "$.ecs"
             },
             "ValidateOutput": {
               "Type": "Task",
@@ -955,10 +957,19 @@ Resources:
               "Next": "DeleteSQSMessage",
               "Catch": [
                 {
-                  "ErrorEquals": ["States.ALL"],
+                  "ErrorEquals": [
+                    "S3.NoSuchKey"
+                  ],
+                  "Next": "ProcessingFailed"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
                   "Next": "ProcessingFailed"
                 }
-              ]
+              ],
+              "ResultPath": "$.validation"
             },
             "DeleteSQSMessage": {
               "Type": "Task",
