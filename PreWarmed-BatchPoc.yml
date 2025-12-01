@@ -1,0 +1,1468 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# Description of what this CloudFormation Template is going to produce
+Description: AWS CloudFormation Template to create a batch deployment pipeline for demo purposes.
+# StackName: Batch PoC Deployment Pipeline
+
+Parameters:
+  DeploymentUserKeySerial:
+    Description: The serial number of the provisioned IAM user programmatic access key. Increment by 1 and update the stack to rotate the key.
+    Type: Number
+    Default: 1
+  
+  VpcId:
+    Description: VPC ID where resources will be deployed
+    Type: AWS::EC2::VPC::Id
+  
+  SubnetId:
+    Description: Subnet ID for Batch and ECS tasks
+    Type: AWS::EC2::Subnet::Id
+  
+  RouteTableId:
+    Description: Route table ID for S3 VPC endpoint
+    Type: String
+  
+
+Resources:
+  #=====================================
+  # VPC Endpoints:
+  #=====================================
+  CloudWatchLogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  ECRAPIVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  ECRDKRVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref RouteTableId
+
+
+#=====================================
+# Security Groups:
+#=====================================
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W9
+            reason: Security group open to full 10 block for poc.
+          - id: F1000
+            reason: All Traffic is allowed outbound for PoC.
+          - id: W36
+            reason: Descriptions not required for PoC.
+    Properties:
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref BatchECSSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref BatchECSSecurityGroup
+
+  BatchECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W40
+            reason: Security group allowed outbound to all for PoC.
+          - id: W5
+            reason: Security group allowed outbound to all for PoC.
+          - id: W36
+            reason: Descriptions not required for PoC.
+    Properties:
+      GroupDescription: Security group for Batch and ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          Description: Allow any egress
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  #=====================================
+  # IAM Deployment User:
+  #=====================================
+  DeploymentUser:
+    Type: AWS::IAM::User
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F2000
+            reason: User not assigned to group as group is un-necessary for single user, use case.
+    Properties:
+      UserName: BatchPoCDeploymentUser
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+  DeploymentUserKey:
+    Type: AWS::IAM::AccessKey
+    Properties: 
+      Serial: !Ref DeploymentUserKeySerial
+      Status: Active
+      UserName: !Ref DeploymentUser
+
+  DeploymentUserIAMPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F11
+            reason: Assigning policy to user because the scope of these permissions pertains only to the Deployment IAM User.
+          - id: W12
+            reason: The iam:GetAccountPasswordPolicy permission requires to be set to * to be able to grab the global password policy.
+    Properties: 
+      PolicyName: Deployment-User-IAM-AccessPolicy
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Sid: AllowGetIAMSelfDetails
+            Effect: Allow
+            Action: 
+              - iam:GetAccountPasswordPolicy
+              - iam:ListVirtualMFADevices
+            Resource: "*"
+          - Sid: AllowManageIAMSelfPassword
+            Effect: Allow
+            Action:
+              - iam:GetUser
+              - iam:ChangePassword
+            Resource: !Join ['', [ 'arn:aws:iam::', !Ref 'AWS::AccountId', ':user/${aws:username}']]
+          - Sid: AllowManageIAMSelfMFADevice
+            Effect: Allow
+            Action:
+              - iam:CreateVirtualMFADevice
+              - iam:DeleteVirtualMFADevice
+            Resource: !Join ['', [ 'arn:aws:iam::', !Ref 'AWS::AccountId', ':mfa/${aws:username}']]
+          - Sid: AllowManageIAMSelfMFA
+            Effect: Allow
+            Action:
+              - iam:DeactivateMFADevice
+              - iam:EnableMFADevice
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ResyncMFADevice
+            Resource: !Join ['', [ 'arn:aws:iam::', !Ref 'AWS::AccountId', ':user/${aws:username}']]
+      Users:
+        - !Ref DeploymentUser
+
+  DeploymentUserKeySSMParam:
+    Type: AWS::SSM::Parameter
+    Properties: 
+      Description: Deployment Programmatic Access KeyPair
+      Name: /Github/Deployment/AccessKey
+      Type: String
+      Value: !Join [" : ", [!Ref DeploymentUserKey, !GetAtt 'DeploymentUserKey.SecretAccessKey']]
+
+
+  #==============================
+  # S3 Buckets:
+  #==============================
+  # Code Bucket for Lambda functions
+  LambdaCodeS3Bucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: PoC Bucket doesn't require logging.
+    Properties:
+      BucketName:
+        Fn::Join:
+          - '-'
+          - - batch-poc-lambda-code-bucket
+            - !Ref AWS::AccountId
+      VersioningConfiguration:
+        Status: Suspended
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  LambdaS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LambdaCodeS3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyNonSecureTransport"
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:*"
+            Resource:
+              - !GetAtt 'LambdaCodeS3Bucket.Arn'
+              - !Join ['/', [!GetAtt 'LambdaCodeS3Bucket.Arn', "*"]]
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action: "s3:PutObject"
+            Resource:
+              - !GetAtt 'LambdaCodeS3Bucket.Arn'
+              - !Join ['/', [!GetAtt 'LambdaCodeS3Bucket.Arn', "*"]]
+            Condition: {"Null": {"s3:x-amz-server-side-encryption": "true"}}
+
+  # S3 Data Input Bucket
+  S3InputBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: PoC Bucket doesn't require logging.
+    Properties:
+      BucketName:
+        Fn::Join:
+          - '-'
+          - - batch-poc-input-bucket
+            - !Ref AWS::AccountId
+      VersioningConfiguration:
+        Status: Suspended
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  S3InputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3InputBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyNonSecureTransport"
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:*"
+            Resource:
+              - !GetAtt 'S3InputBucket.Arn'
+              - !Join ['/', [!GetAtt 'S3InputBucket.Arn', "*"]]
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action: "s3:PutObject"
+            Resource:
+              - !GetAtt 'S3InputBucket.Arn'
+              - !Join ['/', [!GetAtt 'S3InputBucket.Arn', "*"]]
+            Condition: {"Null": {"s3:x-amz-server-side-encryption": "true"}}
+
+  # S3 Data Output Bucket
+  S3OutputBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: PoC Bucket doesn't require logging.
+    Properties:
+      BucketName:
+        Fn::Join:
+          - '-'
+          - - batch-poc-output-bucket
+            - !Ref AWS::AccountId
+      VersioningConfiguration:
+        Status: Suspended
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  S3OutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3OutputBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyNonSecureTransport"
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:*"
+            Resource:
+              - !GetAtt 'S3OutputBucket.Arn'
+              - !Join ['/', [!GetAtt 'S3OutputBucket.Arn', "*"]]
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action: "s3:PutObject"
+            Resource:
+              - !GetAtt 'S3OutputBucket.Arn'
+              - !Join ['/', [!GetAtt 'S3OutputBucket.Arn', "*"]]
+            Condition: {"Null": {"s3:x-amz-server-side-encryption": "true"}}
+
+
+  #==============================
+  # SQS Queue for File Processing:
+  #==============================
+  SQSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log Encryption not required for this PoC.
+    Properties:
+      LogGroupName: !Sub "/aws/sqs/${AWS::StackName}-file-processing-queue"
+      RetentionInDays: 14
+
+  FileProcessingQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W48
+            reason: Default encryption (SSE-SQS) is sufficient for this PoC.
+    Properties:
+      QueueName:
+        Fn::Join:
+          - '-'
+          - - batch-poc-file-processing-queue
+            - !Ref AWS::AccountId
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt 'FileProcessingDeadLetterQueue.Arn'
+        maxReceiveCount: 3
+
+  FileProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W48
+            reason: Default encryption (SSE-SQS) is sufficient for this PoC.
+    Properties:
+      QueueName:
+        Fn::Join:
+          - '-'
+          - - batch-poc-file-processing-dlq
+            - !Ref AWS::AccountId
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  FileProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ToSendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt FileProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt S3InputBucket.Arn
+          - Sid: AllowLambdaAccessToQueue
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SQSProcessorLambdaRole.Arn
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:GetQueueUrl
+              - sqs:ChangeMessageVisibility
+            Resource: !GetAtt FileProcessingQueue.Arn
+          - Sid: AllowAccountAccessToQueue
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:GetQueueUrl
+            Resource: !GetAtt FileProcessingQueue.Arn
+      Queues:
+        - !Ref FileProcessingQueue
+
+  # Lambda function to configure S3 bucket notifications (to avoid circular dependency)
+  BucketNotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketNotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource: !GetAtt S3InputBucket.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource: 
+                  - !GetAtt FileProcessingQueue.Arn
+                  - !GetAtt FileProcessingDeadLetterQueue.Arn
+
+  BucketNotificationLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: While Lambda should be configured with a VPC, this is not required for the PoC.
+          - id: W92
+            reason: Reserved concurrency is not required for this PoC.
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-bucket-notification-config"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt BucketNotificationLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import time
+          import re
+          
+          def handler(event, context):
+              print(f"Event: {json.dumps(event, default=str)}")
+              
+              s3 = boto3.client('s3')
+              sqs = boto3.client('sqs')
+              
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      queue_arn = event['ResourceProperties']['QueueArn']
+                      
+                      print(f"Configuring notification for bucket: {bucket_name}")
+                      print(f"Queue ARN: {queue_arn}")
+                      
+                      # Parse queue ARN to get components
+                      # ARN format: arn:aws:sqs:region:account-id:queue-name
+                      arn_parts = queue_arn.split(':')
+                      if len(arn_parts) != 6 or arn_parts[2] != 'sqs':
+                          raise ValueError(f"Invalid SQS ARN format: {queue_arn}")
+                      
+                      region = arn_parts[3]
+                      account_id = arn_parts[4]
+                      queue_name = arn_parts[5]
+                      
+                      # Construct proper queue URL
+                      queue_url = f"https://sqs.{region}.amazonaws.com/{account_id}/{queue_name}"
+                      
+                      print(f"Constructed queue URL: {queue_url}")
+                      
+                      # Verify SQS queue exists and is accessible
+                      try:
+                          queue_attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=['QueueArn'])
+                          print(f"Queue verified: {queue_attrs['Attributes']['QueueArn']}")
+                      except Exception as e:
+                          print(f"Queue verification failed: {str(e)}")
+                          raise
+                      
+                      # Wait a moment for eventual consistency
+                      time.sleep(2)
+                      
+                      # Configure bucket notification
+                      response = s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration={
+                              'QueueConfigurations': [{
+                                  'Id': 'FileProcessingQueueConfig',
+                                  'QueueArn': queue_arn,
+                                  'Events': ['s3:ObjectCreated:*']
+                              }]
+                          },
+                          ExpectedBucketOwner=account_id
+                      )
+                      
+                      print(f"Notification configured successfully --> :\n{json.dumps(response, default=str)}")
+                      
+                  elif event['RequestType'] == 'Delete':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      
+                      print(f"Removing notification for bucket: {bucket_name}")
+                      
+                      # Remove bucket notification
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration={}
+                      )
+                      
+                      print(f"Notification removed successfully")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  error_msg = f"Error: {str(e)}"
+                  print(error_msg)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=error_msg)
+
+  # Custom resource to configure S3 bucket notifications
+  S3InputBucketNotification:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: 
+      - FileProcessingQueuePolicy
+      - S3InputBucket
+      - BucketNotificationLambda
+    Properties:
+      ServiceToken: !GetAtt BucketNotificationLambda.Arn
+      BucketName: !Ref S3InputBucket
+      QueueArn: !GetAtt FileProcessingQueue.Arn
+
+
+  #==============================
+  # Lambda Function for SQS Processing:
+  #==============================
+  SQSProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt FileProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectMetadata
+                  - s3:HeadObject
+                Resource: !Sub "${S3InputBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: 
+                  - !Ref FileProcessingStateMachine
+
+  SQSProcessorLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: VPC not required for this PoC
+          - id: W92
+            reason: Reserved concurrency not required for this PoC
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sqs-processor"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SQSProcessorLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          # This Variable switches from using the existing state machine
+          # to using a new state machine for each execution. This is to
+          # avoid the state machine being locked by a previous execution.
+          USE_NEW_STATE_MACHINE_EACH_EXECUTION: true
+          STEP_FUNCTION_ARN: !Ref FileProcessingStateMachine
+
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to process SQS messages from S3 ObjectCreated events.
+              """
+              
+              # Initialize AWS clients
+              s3 = boto3.client('s3')
+              stepfunctions = boto3.client('stepfunctions')
+              
+              step_function_arn = os.environ['STEP_FUNCTION_ARN']
+              
+              results = []
+              
+              # Process each SQS record
+              for record in event['Records']:
+                  try:
+                      # Extract SQS message info
+                      message_id = record['messageId']
+                      receipt_handle = record['receiptHandle']
+                      
+                      # Parse S3 event from SQS message body
+                      s3_event = json.loads(record['body'])
+                      
+                      # Process S3 records
+                      for s3_record in s3_event.get('Records', []):
+                          # Validate event
+                          if s3_record.get('eventSource') != 'aws:s3':
+                              continue
+                              
+                          event_name = s3_record.get('eventName', '')
+                          if not event_name.startswith('ObjectCreated:Put'):
+                              continue
+                          
+                          # Extract S3 info
+                          s3_info = s3_record.get('s3', {})
+                          bucket_name = s3_info.get('bucket', {}).get('name')
+                          object_key = s3_info.get('object', {}).get('key')
+                          
+                          if not bucket_name or not object_key:
+                              continue
+                          
+                          # URL decode object key
+                          object_key = object_key.replace('+', ' ')
+                          
+                          # Get object metadata
+                          response = s3.head_object(Bucket=bucket_name, Key=object_key)
+                          metadata = response.get('Metadata', {})
+                          
+                          # Extract queue URL from event source ARN
+                          queue_arn = record['eventSourceARN']
+                          arn_parts = queue_arn.split(':')
+                          queue_url = f"https://sqs.{arn_parts[3]}.amazonaws.com/{arn_parts[4]}/{arn_parts[5]}"
+                          
+                          # Create Step Function payload
+                          payload = {
+                              'sourceBucket': bucket_name,
+                              'objectKey': object_key,
+                              'metadata': {
+                                  'contentType': response.get('ContentType'),
+                                  'contentLength': response.get('ContentLength'),
+                                  'lastModified': response.get('LastModified').isoformat() if response.get('LastModified') else None,
+                                  'etag': response.get('ETag'),
+                                  **metadata
+                              },
+                              'sqsInfo': {
+                                  'messageId': message_id,
+                                  'receiptHandle': receipt_handle,
+                                  'queueUrl': queue_url
+                              }
+                          }
+                          
+                          # Start Step Function execution
+                          sf_response = stepfunctions.start_execution(
+                              stateMachineArn=step_function_arn,
+                              input=json.dumps(payload)
+                          )
+                          
+                          results.append({
+                              'messageId': message_id,
+                              'status': 'success',
+                              'executionArn': sf_response['executionArn']
+                          })
+                          
+                  except Exception as e:
+                      print(f"Error processing record {record.get('messageId', 'unknown')}: {str(e)}")
+                      results.append({
+                          'messageId': record.get('messageId', 'unknown'),
+                          'status': 'error',
+                          'error': str(e)
+                      })
+                      # Don't re-raise - let message stay in queue for manual processing
+                      pass
+              
+              # Return batch item failures to prevent automatic deletion
+              failed_items = []
+              for result in results:
+                  if result['status'] == 'success':
+                      # Add successful items as "failures" to prevent deletion
+                      failed_items.append({'itemIdentifier': result['messageId']})
+              
+              return {
+                  'batchItemFailures': failed_items
+              }
+
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt FileProcessingQueue.Arn
+      FunctionName: !Ref SQSProcessorLambda
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  #==============================
+  # Step Function for File Processing:
+  #==============================
+  FileProcessingStepFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Policy needs to access * for poc.
+          - id: F3
+            reason: Policy needs to access * logs for poc.
+          - id: F38
+            reason: Passrole allowed for PoC. In production, scope down to specific roles.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StepFunctionExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - events:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                Resource: !GetAtt FileProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - batch:SubmitJob
+                  - batch:DescribeJobs
+                Resource: 
+                  - !Ref BatchJobQueue
+                  - !Ref BatchJobDefinition
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:DescribeTasks
+                  - iam:PassRole
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource:
+                  - !Sub "${S3InputBucket.Arn}/*"
+                  - !Sub "${S3OutputBucket.Arn}/*"
+
+  FileProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-file-processing"
+      RoleArn: !GetAtt FileProcessingStepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "File processing workflow with Batch and Fargate routing",
+          "StartAt": "ProcessFile",
+          "States": {
+            "ProcessFile": {
+              "Type": "Pass",
+              "Parameters": {
+                "sourceBucket.$": "$.sourceBucket",
+                "objectKey.$": "$.objectKey",
+                "metadata.$": "$.metadata",
+                "processorType.$": "$.metadata.processor-type",
+                "sqsInfo.$": "$.sqsInfo",
+                "timestamp.$": "$$.State.EnteredTime",
+                "securityGroups": ["${BatchECSSecurityGroup}"]
+              },
+              "Next": "CheckProcessorType"
+            },
+            "CheckProcessorType": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.processorType",
+                  "StringEquals": "pool",
+                  "Next": "SubmitBatchJob"
+                }
+              ],
+              "Default": "RunFargateTask"
+            },
+            "SubmitBatchJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::batch:submitJob.sync",
+              "Parameters": {
+                "JobDefinition": "${BatchJobDefinition}",
+                "JobName.$": "States.Format('job-{}', States.UUID())",
+                "JobQueue": "${BatchJobQueue}",
+                "ContainerOverrides": {
+                  "Environment": [
+                    {
+                      "Name": "SOURCE_BUCKET",
+                      "Value.$": "$.sourceBucket"
+                    },
+                    {
+                      "Name": "OBJECT_KEY",
+                      "Value.$": "$.objectKey"
+                    },
+                    {
+                      "Name": "DEST_BUCKET",
+                      "Value.$": "$.metadata.output-destination"
+                    }
+                  ]
+                }
+              },
+              "Next": "ValidateOutput",
+              "ResultPath": "$.batch"
+            },
+            "RunFargateTask": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "TaskDefinition": "${ECSTaskDefinition}",
+                "Cluster": "${ECSCluster}",
+                "LaunchType": "FARGATE",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ["${SubnetId}"],
+                    "SecurityGroups.$": "$.securityGroups",
+                    "AssignPublicIp": "DISABLED"
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "pdf-converter",
+                      "Environment": [
+                        {
+                          "Name": "SOURCE_BUCKET",
+                          "Value.$": "$.sourceBucket"
+                        },
+                        {
+                          "Name": "OBJECT_KEY",
+                          "Value.$": "$.objectKey"
+                        },
+                        {
+                          "Name": "DEST_BUCKET",
+                          "Value.$": "$.metadata.output-destination"
+                        }
+                      ],
+                      "Command": [
+                        "/usr/bin/bash",
+                        "-c",
+                        "python /app/pdf_converter.py"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Next": "ValidateOutput",
+              "ResultPath": "$.ecs"
+            },
+            "ValidateOutput": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+              "Parameters": {
+                "Bucket.$": "$.metadata.output-destination",
+                "Key.$": "States.Format('{}.pdf', States.ArrayGetItem(States.StringSplit($.objectKey, '.'), 0))"
+              },
+              "Next": "DeleteSQSMessage",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "S3.NoSuchKey"
+                  ],
+                  "Next": "ProcessingFailed"
+                },
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "ProcessingFailed"
+                }
+              ],
+              "ResultPath": "$.validation"
+            },
+            "DeleteSQSMessage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:sqs:deleteMessage",
+              "Parameters": {
+                "QueueUrl.$": "$.sqsInfo.queueUrl",
+                "ReceiptHandle.$": "$.sqsInfo.receiptHandle"
+              },
+              "End": true
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Cause": "File processing failed - output validation failed"
+            }
+          }
+        }
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionLogGroup.Arn
+
+  StepFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log Encryption not required for this PoC.
+    Properties:
+      LogGroupName: !Sub "/aws/stepfunctions/${AWS::StackName}-file-processing"
+      RetentionInDays: 14
+
+  #==============================
+  # Container Repositories:
+  #==============================
+  # FrontEnd Container Repo
+  BatchPoCFERepo:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Desired resource name assigned.
+    Type: "AWS::ECR::Repository"
+    Properties: 
+      RepositoryName: "batch-poc-fe"
+      ImageScanningConfiguration: 
+        ScanOnPush: "true"
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement: 
+          - Sid: AllowPushOnly
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt 'DeploymentUser.Arn'
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+          - Sid: AllowPullOnly
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:DescribeRepositories
+              - ecr:DescribeImages
+              - ecr:BatchGetImage
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+              "rules": [
+                  {
+                      "rulePriority": 1,
+                      "description": "Retain 5 tagged images, expire all others",
+                      "selection": {
+                          "tagStatus": "tagged",
+                          "tagPrefixList": ["release", "dev"],
+                          "countType": "imageCountMoreThan",
+                          "countNumber": 5
+                      },
+                      "action": {
+                          "type": "expire"
+                      }
+                  },
+                  {
+                      "rulePriority": 2,
+                      "description": "Retain untagged images for 1 day",
+                      "selection": {
+                          "tagStatus": "untagged",
+                          "countType": "sinceImagePushed",
+                          "countUnit": "days",
+                          "countNumber": 1
+                      },
+                      "action": {
+                          "type": "expire"
+                      }
+                  }
+              ]
+          }
+
+  # Conversion Container Repo
+  BatchPoCPDFConversionRepo:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Desired resource name assigned.
+    Type: "AWS::ECR::Repository"
+    Properties: 
+      RepositoryName: "batch-poc-pdfconverter"
+      ImageScanningConfiguration: 
+        ScanOnPush: "true"
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement: 
+          - Sid: AllowPushOnly
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt 'DeploymentUser.Arn'
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+          - Sid: AllowPullOnly
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:DescribeRepositories
+              - ecr:DescribeImages
+              - ecr:BatchGetImage
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+              "rules": [
+                  {
+                      "rulePriority": 1,
+                      "description": "Retain 5 tagged images, expire all others",
+                      "selection": {
+                          "tagStatus": "tagged",
+                          "tagPrefixList": ["release", "dev"],
+                          "countType": "imageCountMoreThan",
+                          "countNumber": 5
+                      },
+                      "action": {
+                          "type": "expire"
+                      }
+                  },
+                  {
+                      "rulePriority": 2,
+                      "description": "Retain untagged images for 1 day",
+                      "selection": {
+                          "tagStatus": "untagged",
+                          "countType": "sinceImagePushed",
+                          "countUnit": "days",
+                          "countNumber": 1
+                      },
+                      "action": {
+                          "type": "expire"
+                      }
+                  }
+              ]
+          }
+
+  #============================
+  # Batch Resources:
+  #============================
+  BatchExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Role should have permissions to pull any image from ECR for PoC.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${S3InputBucket.Arn}/*"
+                  - !Sub "${S3OutputBucket.Arn}/*"
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeEnvironmentName: !Sub "${AWS::StackName}-compute-env"
+      ComputeResources:
+        Type: FARGATE
+        MaxvCpus: 256
+        Subnets:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref BatchECSSecurityGroup
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub "${AWS::StackName}-job-queue"
+      ComputeEnvironmentOrder:
+        - ComputeEnvironment: !Ref BatchComputeEnvironment
+          Order: 1
+      Priority: 1
+      State: ENABLED
+
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: !Sub "${AWS::StackName}-pdf-converter"
+      PlatformCapabilities:
+        - FARGATE
+      ContainerProperties:
+        Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/batch-poc-pdfconverter:latest"
+        JobRoleArn: !GetAtt BatchExecutionRole.Arn
+        ExecutionRoleArn: !GetAtt BatchExecutionRole.Arn
+        ResourceRequirements:
+          - Type: VCPU
+            Value: "0.25"
+          - Type: MEMORY
+            Value: "512"
+        NetworkConfiguration:
+          AssignPublicIp: DISABLED
+      RetryStrategy:
+        Attempts: 3
+
+  #============================
+  # ECS Resources for Fargate:
+  #============================
+  # ECSServiceLinkedRole:
+  #   Type: AWS::IAM::ServiceLinkedRole
+  #   Properties:
+  #     AWSServiceName: ecs.amazonaws.com
+  #     Description: Service-linked role for Amazon ECS
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-fargate-cluster"
+      CapacityProviders:
+        - FARGATE
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-pdf-converter"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn: !GetAtt BatchExecutionRole.Arn
+      TaskRoleArn: !GetAtt BatchExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: pdf-converter
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/batch-poc-pdfconverter:latest"
+          Essential: true
+          Command:
+            - "/usr/bin/bash"
+            - "-c"
+            - "while true; do sleep 300; echo \"Warming container service - $(date)\"; done"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: Log Encryption not required for this PoC.
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-pdf-converter"
+      RetentionInDays: 14
+
+  #=====================================
+  # Pre-warming Infrastructure:
+  #=====================================
+  # Service to keep containers warm
+  PreWarmService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-prewarm-service"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetId
+          SecurityGroups:
+            - !Ref BatchECSSecurityGroup
+          AssignPublicIp: DISABLED
+
+
+#==============================
+# Outputs:
+#==============================
+Outputs:
+  S3InputBucketName:
+    Description: "Name of the S3 Input Bucket"
+    Value: !Ref S3InputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}:S3InputBucketName"
+
+  S3InputBucketArn:
+    Description: "ARN of the S3 Input Bucket"
+    Value: !GetAtt S3InputBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}:S3InputBucketArn"
+
+  S3OutputBucketName:
+    Description: "Name of the S3 Output Bucket"
+    Value: !Ref S3OutputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}:S3OutputBucketName"
+
+  S3OutputBucketArn:
+    Description: "ARN of the S3 Output Bucket"
+    Value: !GetAtt S3OutputBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}:S3OutputBucketArn"
+
+  FileProcessingQueueUrl:
+    Description: "URL of the File Processing SQS Queue"
+    Value: !Ref FileProcessingQueue
+    Export:
+      Name: !Sub "${AWS::StackName}:FileProcessingQueueUrl"
+
+  FileProcessingQueueArn:
+    Description: "ARN of the File Processing SQS Queue"
+    Value: !GetAtt FileProcessingQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}:FileProcessingQueueArn"
+
+  StepFunctionArn:
+    Description: "ARN of the File Processing Step Function"
+    Value: !Ref FileProcessingStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}:StepFunctionArn"
+
+  FileProcessingQueueName:
+    Description: "Name of the File Processing SQS Queue"
+    Value: !GetAtt FileProcessingQueue.QueueName
+    Export:
+      Name: !Sub "${AWS::StackName}:FileProcessingQueueName"
+
+  DeadLetterQueueUrl:
+    Description: "URL of the Dead Letter Queue"
+    Value: !Ref FileProcessingDeadLetterQueue
+    Export:
+      Name: !Sub "${AWS::StackName}:DeadLetterQueueUrl"
+
+  DeploymentUserAccessKey:
+    Description: "Access Key for Deployment User (stored in SSM Parameter)"
+    Value: !Ref DeploymentUserKeySSMParam
+    Export:
+      Name: !Sub "${AWS::StackName}:DeploymentUserAccessKeySSM"
+
+
+#==============================
+# Notes:
+#==============================
+# Test Custom Resource Lambda
+# -----------------------------
+# {
+#   "RequestType" : "Create",
+#   "RequestId" : "1234567890",
+#   "ResponseURL" : "NA",
+#   "ResourceType" : "Custom::MyCustomResourceType",
+#   "LogicalResourceId" : "S3InputBucketNotification",
+#   "StackId" : "arn:aws:cloudformation:eu-central-1:123456789101:stack/BatchPoC/58f5e810-a8f5-11f0-a6a3-0287e9a5a0b7",
+#   "ResourceProperties" : {
+#     "ServiceToken" : "arn:aws:lambda:eu-central-1:123456789101:function:BatchPoC-bucket-notification-config",
+#     "BucketName" : "batch-poc-input-bucket-123456789101",
+#     "QueueArn" : "arn:aws:sqs:eu-central-1:123456789101:batch-poc-file-processing-queue-123456789101"
+#   }
+# }
+
+
+# Example SQS Message from S3 Event Notification
+# -----------------------------
+# {
+#   "Records": [
+#     {
+#       "eventVersion": "2.1",
+#       "eventSource": "aws:s3",
+#       "awsRegion": "eu-central-1",
+#       "eventTime": "2025-10-14T16:43:18.360Z",
+#       "eventName": "ObjectCreated:Put",
+#       "userIdentity": {
+#         "principalId": "AWS:XXXXXXXXXXXXXXXXXXXXX:jdoe-XXXXXXXX"
+#       },
+#       "requestParameters": {
+#         "sourceIPAddress": "12.123.12.123"
+#       },
+#       "responseElements": {
+#         "x-amz-request-id": "7YBSM97YAA3RNHM5",
+#         "x-amz-id-2": "wpfL9qfZ33VbDKfAAOHACrsQfUrEl7dIwIcxYLX3JtDoaTYR5zwFuyXT9gBTSFy/xIyERitz5WryMGqTqvDjJedZTp8Cvi8e"
+#       },
+#       "s3": {
+#         "s3SchemaVersion": "1.0",
+#         "configurationId": "FileProcessingQueueConfig",
+#         "bucket": {
+#           "name": "batch-poc-input-bucket-123456789101",
+#           "ownerIdentity": {
+#             "principalId": "A3D3EM1U7RFW5T"
+#           },
+#           "arn": "arn:aws:s3:::batch-poc-input-bucket-123456789101"
+#         },
+#         "object": {
+#           "key": "requirements.txt",
+#           "size": 65,
+#           "eTag": "1b553ba957dd99902c6f81662de44aa6",
+#           "sequencer": "0068EE7DA654C673F4"
+#         }
+#       }
+#     }
+#   ]
+# }
