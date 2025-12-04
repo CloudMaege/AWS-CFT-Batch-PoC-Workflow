@@ -29,3 +29,6 @@ docker run --rm \
 - `AWS_ACCESS_KEY_ID`: AWS access key
 - `AWS_SECRET_ACCESS_KEY`: AWS secret key
 - `AWS_DEFAULT_REGION`: AWS region
+
+## API Version
+If running the API version, then flask>=2.0.0 must be installed as a requirement, and the build script should be modified to build and push the image with the :api tag instead of the:latest tag for testing. The API step function workflow is configured to look for the :api tag for the image pull.
